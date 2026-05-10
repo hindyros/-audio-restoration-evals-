@@ -23,42 +23,51 @@ import eval_runner as er
 
 DATA_ROOT = Path("data")
 
-# ── Discover restored directories ─────────────────────────────────────────────
+CSV_FIELDNAMES = ["condition", "file", "action_id", "ground_truth",
+                  "predicted", "correct", "wer", "transcript"]
+
+# Excel row fill colours keyed by condition name
+_FILL_HEX = {"clean": "D9EAD3", "distorted": "FCE5CD"}
+_FILL_HEX_DEFAULT = "CFE2F3"
+
 
 def discover_restored_dirs() -> list[tuple[str, Path]]:
-    """Return [(label, path)] for each restored_* dir that contains WAVs.
+    """Return [(label, path)] for each restored_* dir containing WAVs.
 
-    data/restored/ is included as label "restored" only if it is NOT a
-    duplicate of restored_auto_any (same file set).
+    data/restored/ is skipped when its WAV set is identical to restored_auto_any
+    (it is populated from that source by default and would be a duplicate run).
     """
-    dirs: list[tuple[str, Path]] = []
-
     default_dir = DATA_ROOT / "restored"
     auto_any_dir = DATA_ROOT / "restored_auto_any"
 
-    # Check if default restored/ is a duplicate of restored_auto_any
-    default_is_dup = False
-    if default_dir.exists() and auto_any_dir.exists():
-        default_wavs = {f.name for f in default_dir.glob("*.wav")}
-        auto_any_wavs = {f.name for f in auto_any_dir.glob("*.wav")}
-        if default_wavs == auto_any_wavs:
-            default_is_dup = True
+    default_wavs = {f.name for f in default_dir.glob("*.wav")} if default_dir.exists() else set()
+    auto_any_wavs = {f.name for f in auto_any_dir.glob("*.wav")} if auto_any_dir.exists() else set()
 
-    if not default_is_dup and default_dir.exists() and any(default_dir.glob("*.wav")):
+    dirs: list[tuple[str, Path]] = []
+    if default_wavs and default_wavs != auto_any_wavs:
         dirs.append(("restored", default_dir))
 
     for d in sorted(DATA_ROOT.glob("restored_*")):
         if d.is_dir() and any(d.glob("*.wav")):
-            label = d.name[len("restored_"):]
-            dirs.append((label, d))
+            dirs.append((d.name[len("restored_"):], d))
 
     return dirs
 
 
-# ── Terminal table ─────────────────────────────────────────────────────────────
+def _make_summary_row(label: str, results: list[dict]) -> dict:
+    n = len(results)
+    correct = sum(r["correct"] for r in results)
+    wer_vals = [r["wer"] for r in results if r.get("wer") is not None]
+    return {
+        "condition": label,
+        "n": n,
+        "correct": correct,
+        "car": round(correct / n, 4) if n else 0.0,
+        "mean_wer": round(sum(wer_vals) / len(wer_vals), 4) if wer_vals else None,
+    }
+
 
 def print_summary_table(rows: list[dict]) -> None:
-    """Print a fixed-width table of condition results to stdout."""
     col_w = {"condition": 22, "n": 5, "correct": 8, "car": 8, "wer": 9}
     header = (
         f"{'Condition':<{col_w['condition']}}"
@@ -83,83 +92,57 @@ def print_summary_table(rows: list[dict]) -> None:
     print(sep + "\n")
 
 
-# ── Excel output ───────────────────────────────────────────────────────────────
-
-def write_excel(
-    summary_rows: list[dict],
-    all_raw: list[dict],
-    output_path: Path,
-) -> None:
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
-
-    wb = openpyxl.Workbook()
-
-    # ── Summary sheet ──────────────────────────────────────────────────────
-    ws_sum = wb.active
-    ws_sum.title = "Summary"
-
-    hdr_font  = Font(bold=True, color="FFFFFF")
-    hdr_fill  = PatternFill("solid", fgColor="2F5597")
-    clean_fill = PatternFill("solid", fgColor="D9EAD3")
-    dist_fill  = PatternFill("solid", fgColor="FCE5CD")
-    rest_fill  = PatternFill("solid", fgColor="CFE2F3")
-
-    sum_headers = ["Condition", "N", "Correct", "CAR", "Mean WER"]
-    ws_sum.append(sum_headers)
-    for col, _ in enumerate(sum_headers, 1):
-        cell = ws_sum.cell(1, col)
+def _style_header_row(ws, n_cols: int, hdr_font, hdr_fill) -> None:
+    from openpyxl.styles import Alignment
+    for col in range(1, n_cols + 1):
+        cell = ws.cell(1, col)
         cell.font = hdr_font
         cell.fill = hdr_fill
         cell.alignment = Alignment(horizontal="center")
+
+
+def write_excel(summary_rows: list[dict], all_raw: list[dict], output_path: Path) -> None:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    hdr_font = Font(bold=True, color="FFFFFF")
+    hdr_fill = PatternFill("solid", fgColor="2F5597")
+
+    wb = openpyxl.Workbook()
+
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+    sum_headers = ["Condition", "N", "Correct", "CAR", "Mean WER"]
+    ws_sum.append(sum_headers)
+    _style_header_row(ws_sum, len(sum_headers), hdr_font, hdr_fill)
 
     for r in summary_rows:
         wer_val = r["mean_wer"] if r["mean_wer"] is not None else ""
         ws_sum.append([r["condition"], r["n"], r["correct"], r["car"], wer_val])
         row_idx = ws_sum.max_row
-        cond = r["condition"]
-        if cond == "clean":
-            fill = clean_fill
-        elif cond == "distorted":
-            fill = dist_fill
-        else:
-            fill = rest_fill
+        fill_hex = _FILL_HEX.get(r["condition"], _FILL_HEX_DEFAULT)
+        row_fill = PatternFill("solid", fgColor=fill_hex)
         for col in range(1, 6):
-            ws_sum.cell(row_idx, col).fill = fill
-
-        # Format CAR as percentage
+            ws_sum.cell(row_idx, col).fill = row_fill
         ws_sum.cell(row_idx, 4).number_format = "0.0%"
-        if wer_val != "":
+        if wer_val:
             ws_sum.cell(row_idx, 5).number_format = "0.000"
 
-    # Column widths
     for col, width in zip(range(1, 6), [24, 6, 9, 9, 10]):
         ws_sum.column_dimensions[get_column_letter(col)].width = width
 
-    # ── Raw sheet ──────────────────────────────────────────────────────────
     ws_raw = wb.create_sheet("Raw")
-    raw_headers = ["condition", "file", "action_id", "ground_truth",
-                   "predicted", "correct", "wer", "transcript"]
-    ws_raw.append(raw_headers)
-    for col in range(1, len(raw_headers) + 1):
-        cell = ws_raw.cell(1, col)
-        cell.font = hdr_font
-        cell.fill = hdr_fill
-        cell.alignment = Alignment(horizontal="center")
-
+    ws_raw.append(CSV_FIELDNAMES)
+    _style_header_row(ws_raw, len(CSV_FIELDNAMES), hdr_font, hdr_fill)
     for row in all_raw:
-        ws_raw.append([row.get(h, "") for h in raw_headers])
-
-    # Auto-width for raw sheet (cap at 60)
+        ws_raw.append([row.get(h, "") for h in CSV_FIELDNAMES])
     for col_cells in ws_raw.columns:
         max_len = max((len(str(c.value or "")) for c in col_cells), default=8)
         ws_raw.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 60)
 
     wb.save(output_path)
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -181,72 +164,42 @@ def main() -> None:
     for label, path in restored_dirs:
         print(f"  {label:25s}  {path}")
 
-    # ── Step 1: Transcribe clean to get WER references ──────────────────
-    clean_dir = er.DATA_DIRS["clean"]
-    reference_transcripts: dict[str, str] = {}
-    if clean_dir.exists():
-        print("\nStep 1/3 — Transcribing clean audio for WER references …")
-        reference_transcripts = er.build_reference_transcripts(clean_dir)
-        print(f"  {len(reference_transcripts)} references ready.")
-    else:
-        print("[WARN] data/clean/ not found — WER will be skipped.")
-
-    # ── Step 2: Run clean + distorted ────────────────────────────────────
     all_raw: list[dict] = []
     summary_rows: list[dict] = []
+    reference_transcripts: dict[str, str] = {}
 
     for cond in ("clean", "distorted"):
         data_dir = er.DATA_DIRS[cond]
         if not data_dir.exists():
             print(f"\n[SKIP] {cond}: {data_dir} not found")
             continue
-        print(f"\nStep 2/3 — Running condition: {cond} ({data_dir})")
-        refs = reference_transcripts if cond != "clean" else None
-        results = er.run_condition(cond, data_dir, reference_transcripts=refs)
-        if cond == "clean" and not reference_transcripts:
+        print(f"\nRunning condition: {cond} ({data_dir})")
+        results = er.run_condition(
+            cond, data_dir,
+            reference_transcripts=reference_transcripts if cond != "clean" else None,
+        )
+        if cond == "clean":
             reference_transcripts = {Path(r["file"]).stem: r["transcript"] for r in results}
+            print(f"  {len(reference_transcripts)} clean references ready for WER.")
         all_raw.extend(results)
-        n = len(results)
-        correct = sum(r["correct"] for r in results)
-        wer_vals = [r["wer"] for r in results if r.get("wer") is not None]
-        summary_rows.append({
-            "condition": cond,
-            "n": n,
-            "correct": correct,
-            "car": round(correct / n, 4) if n else 0.0,
-            "mean_wer": round(sum(wer_vals) / len(wer_vals), 4) if wer_vals else None,
-        })
-        print(f"  {n} samples evaluated")
+        summary_rows.append(_make_summary_row(cond, results))
+        print(f"  {len(results)} samples evaluated")
 
-    # ── Step 3: Run each restored condition ───────────────────────────────
-    print(f"\nStep 3/3 — Running {len(restored_dirs)} restored condition(s) …")
+    print(f"\nRunning {len(restored_dirs)} restored condition(s) …")
     for label, path in restored_dirs:
         print(f"\n  Condition: {label} ({path})")
         results = er.run_condition(label, path, reference_transcripts=reference_transcripts)
         all_raw.extend(results)
-        n = len(results)
-        correct = sum(r["correct"] for r in results)
-        wer_vals = [r["wer"] for r in results if r.get("wer") is not None]
-        summary_rows.append({
-            "condition": label,
-            "n": n,
-            "correct": correct,
-            "car": round(correct / n, 4) if n else 0.0,
-            "mean_wer": round(sum(wer_vals) / len(wer_vals), 4) if wer_vals else None,
-        })
-        print(f"    {n} samples evaluated")
+        summary_rows.append(_make_summary_row(label, results))
+        print(f"    {len(results)} samples evaluated")
 
-    # ── Print terminal table ──────────────────────────────────────────────
     print_summary_table(summary_rows)
 
-    # ── Write outputs ─────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     raw_path = output_dir / f"all_raw_{timestamp}.csv"
-    fieldnames = ["condition", "file", "action_id", "ground_truth",
-                  "predicted", "correct", "wer", "transcript"]
     with open(raw_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(all_raw)
 
